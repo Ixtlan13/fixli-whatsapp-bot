@@ -1,6 +1,6 @@
 {
   "name": "fixli-whatsapp-gpt-bot",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "24/7 Autonomous WhatsApp GPT Bot for Fixli Handyman & Moving Services",
   "main": "server.js",
   "scripts": {
