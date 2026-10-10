@@ -1,0 +1,20 @@
+{
+  "name": "fixli-whatsapp-gpt-bot",
+  "version": "1.0.0",
+  "description": "24/7 Autonomous WhatsApp GPT Bot for Fixli Handyman & Moving Services",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.16",
+    "express": "^4.21.2",
+    "dotenv": "^16.4.7",
+    "qrcode": "^1.5.4",
+    "openai": "^4.86.1",
+    "pino": "^9.6.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
