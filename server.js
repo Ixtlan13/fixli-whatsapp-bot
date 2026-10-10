@@ -267,7 +267,16 @@ app.get("/health", (req, res) => {
   res.status(200).send("OK");
 });
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server listening on 0.0.0.0:${PORT}`);
+const MAIN_PORT = process.env.PORT || 8080;
+app.listen(MAIN_PORT, "0.0.0.0", () => {
+  console.log(`Server listening on 0.0.0.0:${MAIN_PORT}`);
   connectToWhatsApp();
 });
+
+if (MAIN_PORT != 3000) {
+  try {
+    app.listen(3000, "0.0.0.0", () => {
+      console.log("Server also listening on 0.0.0.0:3000");
+    });
+  } catch (e) {}
+}
