@@ -277,6 +277,30 @@ app.get("/check-phone", async (req, res) => {
   }
 });
 
+// Reset session cleanly
+app.get("/reset-session", async (req, res) => {
+  const fs = require("fs");
+  const path = require("path");
+  try {
+    if (waSock) {
+      try { waSock.end(); } catch (e) {}
+    }
+    isConnected = false;
+    currentQR = null;
+    const authDir = path.join(__dirname, "auth_info_baileys");
+    if (fs.existsSync(authDir)) {
+      fs.rmSync(authDir, { recursive: true, force: true });
+    }
+    fs.mkdirSync(authDir, { recursive: true });
+    setTimeout(() => {
+      connectToWhatsApp();
+    }, 1500);
+    res.json({ success: true, message: "Сессия успешно сброшена! Откройте /qr для новой чистой привязки." });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Debug endpoint: inspect logged-in WhatsApp account and recent events
 app.get("/debug", (req, res) => {
   res.json({
@@ -326,6 +350,7 @@ app.get("/", (req, res) => {
         .badge.online { background: #10b981; color: #fff; }
         .badge.waiting { background: #f59e0b; color: #fff; }
         a.btn { display: inline-block; margin-top: 20px; background: #2563eb; color: #fff; padding: 12px 24px; text-decoration: none; border-radius: 8px; font-weight: bold; }
+        a.btn-danger { display: inline-block; margin-top: 10px; background: #dc2626; color: #fff; padding: 8px 16px; text-decoration: none; border-radius: 6px; font-size: 13px; }
       </style>
     </head>
     <body>
@@ -336,6 +361,8 @@ app.get("/", (req, res) => {
         </div>
         <p>${isConnected ? "WhatsApp подключен к номеру Fixli (" + (waSock?.user?.id || "") + "). Бот принимает входящие заявки и отвечает через " + (isGemini ? "Google Gemini (FREE)" : "GPT-4o") + "." : "WhatsApp не привязан. Нажмите кнопку ниже для привязки через QR или код."}</p>
         ${!isConnected ? '<a class="btn" href="/qr">Открыть страницу привязки</a>' : '<p style="color:#10b981;">Все системы работают в штатном режиме.</p>'}
+        <br><br>
+        <a class="btn-danger" href="/reset-session" onclick="return confirm('Сбросить авторизацию WhatsApp для новой чистой привязки?')">Перепривязать WhatsApp (Сброс)</a>
       </div>
     </body>
     </html>
@@ -350,6 +377,8 @@ app.get("/qr", (req, res) => {
         <p>Аккаунт: ${waSock?.user?.id || "Fixli"}</p>
         <p>Бот активен и отвечает на сообщения.</p>
         <a href="/" style="color:#60a5fa;">Вернуться на главную</a>
+        <br><br>
+        <a href="/reset-session" style="color:#ef4444;font-size:13px;" onclick="return confirm('Сбросить сессию?')">Сбросить сессию и привязать заново</a>
       </body>
     `);
   }
