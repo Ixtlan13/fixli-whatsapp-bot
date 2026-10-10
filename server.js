@@ -20,6 +20,7 @@ let waSock = null;
 let lastUpsertEvent = null;
 let lastIncomingMessage = null;
 let lastOutgoingMessage = null;
+const messageStore = new Map();
 
 // Determine AI Provider (Google Gemini is 100% free; fallback to OpenAI)
 const rawKey = (process.env.GEMINI_API_KEY || process.env.OPENAI_API_KEY || "").trim();
@@ -88,10 +89,14 @@ async function connectToWhatsApp() {
     printQRInTerminal: false,
     logger: pino({ level: "silent" }),
     browser: Browsers.ubuntu("Chrome"),
+    markOnlineOnConnect: true,
     syncFullHistory: false,
     connectTimeoutMs: 60000,
     defaultQueryTimeoutMs: 60000,
-    keepAliveIntervalMs: 10000
+    keepAliveIntervalMs: 15000,
+    getMessage: async (key) => {
+      return messageStore.get(key.id) || undefined;
+    }
   });
 
   waSock.ev.on("connection.update", async (update) => {
@@ -126,6 +131,7 @@ async function connectToWhatsApp() {
 
     for (const msg of m.messages) {
       if (!msg || !msg.message) continue;
+      if (msg.key?.id) messageStore.set(msg.key.id, msg.message);
 
       const remoteJid = msg.key.remoteJid;
       if (!remoteJid || remoteJid.includes("@g.us") || remoteJid.includes("status@broadcast")) continue;
@@ -253,6 +259,21 @@ app.get("/test-ai", async (req, res) => {
       model: AI_MODEL,
       message: err.message
     });
+  }
+});
+
+// Check if a phone number exists on WhatsApp
+app.get("/check-phone", async (req, res) => {
+  const phone = req.query.phone || "972532464636";
+  const cleanPhone = phone.replace(/\D/g, "");
+  if (!waSock || !isConnected) {
+    return res.status(500).json({ error: "WhatsApp not connected" });
+  }
+  try {
+    const result = await waSock.onWhatsApp(cleanPhone);
+    res.json({ queried: cleanPhone, result, myUser: waSock.user });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
