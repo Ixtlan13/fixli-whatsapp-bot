@@ -18,9 +18,24 @@ let currentQR = null;
 let isConnected = false;
 let waSock = null;
 
-// OpenAI client
+// Determine AI Provider (Google Gemini is 100% free; fallback to OpenAI)
+const rawKey = (process.env.GEMINI_API_KEY || process.env.OPENAI_API_KEY || "").trim();
+const isGemini =
+  !!process.env.GEMINI_API_KEY ||
+  rawKey.startsWith("AIzaSy") ||
+  rawKey.startsWith("AQ.") ||
+  process.env.AI_PROVIDER === "gemini";
+
+const AI_MODEL = isGemini
+  ? (process.env.GEMINI_MODEL || "gemini-flash-latest")
+  : (process.env.OPENAI_MODEL || "gpt-4o-mini");
+
+console.log(`[AI CONFIG] Provider: ${isGemini ? "Google Gemini (FREE)" : "OpenAI"}, Model: ${AI_MODEL}`);
+
+// OpenAI client (compatible with both OpenAI and Google Gemini endpoint)
 const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY || "YOUR_OPENAI_API_KEY"
+  apiKey: rawKey || "YOUR_KEY",
+  baseURL: isGemini ? "https://generativelanguage.googleapis.com/v1beta/openai/" : undefined
 });
 
 // In-memory conversation history per customer phone: Map<phone, Array<{role, content}>>
@@ -69,7 +84,6 @@ async function connectToWhatsApp() {
     auth: state,
     printQRInTerminal: false,
     logger: pino({ level: "silent" }),
-    // Official trusted browser fingerprint so WhatsApp doesn't block linking
     browser: Browsers.ubuntu("Chrome"),
     connectTimeoutMs: 60000,
     defaultQueryTimeoutMs: 60000,
@@ -101,7 +115,7 @@ async function connectToWhatsApp() {
 
   waSock.ev.on("creds.update", saveCreds);
 
-  // Incoming message handler - handles all messages in array & unwraps ephemeral/viewOnce
+  // Incoming message handler
   waSock.ev.on("messages.upsert", async (m) => {
     if (!m.messages || !m.messages.length) return;
 
@@ -147,10 +161,10 @@ async function connectToWhatsApp() {
       try {
         await waSock.sendPresenceUpdate("composing", remoteJid);
 
-        console.log(`[AI] Generating response for +${customerPhone}...`);
+        console.log(`[AI] Generating response for +${customerPhone} using ${AI_MODEL}...`);
 
         const response = await openai.chat.completions.create({
-          model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+          model: AI_MODEL,
           messages: [{ role: "system", content: SYSTEM_PROMPT }, ...history],
           temperature: 0.6,
           max_tokens: 300
@@ -174,7 +188,7 @@ async function connectToWhatsApp() {
         await waSock.sendMessage(remoteJid, { text: clientText });
         console.log(`✅ [OUTGOING SENT] +${customerPhone}: ${clientText}\n`);
       } catch (err) {
-        console.error(`❌ [ERROR HANDLING MSG] +${customerPhone}:`, err.message);
+        console.error(`❌ [AI / SEND ERROR] +${customerPhone}:`, err.message);
         try {
           await waSock.sendMessage(remoteJid, {
             text: "שלום! קיבלנו את פנייתך ב-Fixli. מומחה מטעמנו יחזור אליך בהקדם האפשרי. / Здравствуйте! Мы получили ваше обращение в Fixli. Мастер свяжется с вами в ближайшее время."
@@ -209,25 +223,27 @@ app.get("/pair", async (req, res) => {
   }
 });
 
-// Diagnostic endpoint to verify OpenAI credentials
+// Diagnostic endpoint to verify AI credentials
 app.get("/test-ai", async (req, res) => {
   try {
-    const rawKey = process.env.OPENAI_API_KEY || "";
     const keyPreview = rawKey.length > 8 ? `${rawKey.slice(0, 7)}...${rawKey.slice(-4)}` : "NOT_SET";
     const response = await openai.chat.completions.create({
-      model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+      model: AI_MODEL,
       messages: [{ role: "user", content: "Ответь одним словом: РАБОТАЕТ" }],
       max_tokens: 10
     });
     res.json({
       status: "ok",
+      provider: isGemini ? "Google Gemini (FREE)" : "OpenAI",
+      model: AI_MODEL,
       apiKeyConfigured: keyPreview,
       reply: response.choices[0]?.message?.content
     });
   } catch (err) {
     res.status(500).json({
       status: "error",
-      apiKeyConfigured: process.env.OPENAI_API_KEY ? "YES" : "NO",
+      provider: isGemini ? "Google Gemini (FREE)" : "OpenAI",
+      model: AI_MODEL,
       message: err.message
     });
   }
@@ -257,7 +273,7 @@ app.get("/", (req, res) => {
         <div class="badge ${isConnected ? "online" : "waiting"}">
           ${isConnected ? "● ОНЛАЙН 24/7" : "ОЖИДАНИЕ ПРИВЯЗКИ WHATSAPP"}
         </div>
-        <p>${isConnected ? "WhatsApp подключен к номеру Fixli. Бот принимает входящие заявки и отвечает через GPT-4o-mini." : "WhatsApp не привязан. Нажмите кнопку ниже для привязки через QR или код."}</p>
+        <p>${isConnected ? "WhatsApp подключен к номеру Fixli. Бот принимает входящие заявки и отвечает через " + (isGemini ? "Google Gemini (FREE)" : "GPT-4o") + "." : "WhatsApp не привязан. Нажмите кнопку ниже для привязки через QR или код."}</p>
         ${!isConnected ? '<a class="btn" href="/qr">Открыть страницу привязки</a>' : '<p style="color:#10b981;">Все системы работают в штатном режиме.</p>'}
       </div>
     </body>
@@ -293,7 +309,6 @@ app.get("/qr", (req, res) => {
         .divider span { position: absolute; top: -10px; left: 50%; transform: translateX(-50%); background: #151c2c; padding: 0 10px; color: #94a3b8; font-size: 12px; }
       </style>
       <script>
-        // Auto-refresh QR code every 3 seconds so it NEVER expires
         setInterval(async () => {
           try {
             const res = await fetch('/status');
