@@ -17,6 +17,9 @@ const PORT = process.env.PORT || 3000;
 let currentQR = null;
 let isConnected = false;
 let waSock = null;
+let lastUpsertEvent = null;
+let lastIncomingMessage = null;
+let lastOutgoingMessage = null;
 
 // Determine AI Provider (Google Gemini is 100% free; fallback to OpenAI)
 const rawKey = (process.env.GEMINI_API_KEY || process.env.OPENAI_API_KEY || "").trim();
@@ -85,6 +88,7 @@ async function connectToWhatsApp() {
     printQRInTerminal: false,
     logger: pino({ level: "silent" }),
     browser: Browsers.ubuntu("Chrome"),
+    syncFullHistory: false,
     connectTimeoutMs: 60000,
     defaultQueryTimeoutMs: 60000,
     keepAliveIntervalMs: 10000
@@ -109,7 +113,7 @@ async function connectToWhatsApp() {
     } else if (connection === "open") {
       isConnected = true;
       currentQR = null;
-      console.log("✅ WhatsApp connected successfully to Fixli line!");
+      console.log("✅ WhatsApp connected successfully to Fixli line! User:", JSON.stringify(waSock.user));
     }
   });
 
@@ -117,10 +121,11 @@ async function connectToWhatsApp() {
 
   // Incoming message handler
   waSock.ev.on("messages.upsert", async (m) => {
+    lastUpsertEvent = { time: new Date().toISOString(), type: m.type, count: m.messages?.length };
     if (!m.messages || !m.messages.length) return;
 
     for (const msg of m.messages) {
-      if (!msg || !msg.message || msg.key.fromMe) continue;
+      if (!msg || !msg.message) continue;
 
       const remoteJid = msg.key.remoteJid;
       if (!remoteJid || remoteJid.includes("@g.us") || remoteJid.includes("status@broadcast")) continue;
@@ -141,11 +146,12 @@ async function connectToWhatsApp() {
         content.imageMessage?.caption ||
         "";
 
-      if (!text || !text.trim()) {
-        console.log(`[SKIPPED NON-TEXT/PROTOCOL MSG] from +${customerPhone}`);
-        continue;
-      }
+      console.log(`[RAW MSG] fromMe: ${msg.key.fromMe}, jid: ${remoteJid}, text: ${text || "<empty/media>"}`);
 
+      if (msg.key.fromMe) continue;
+      if (!text || !text.trim()) continue;
+
+      lastIncomingMessage = { time: new Date().toISOString(), from: customerPhone, text };
       console.log(`\n💬 [INCOMING] +${customerPhone}: ${text}`);
 
       if (!conversations.has(customerPhone)) {
@@ -184,15 +190,16 @@ async function connectToWhatsApp() {
 
         history.push({ role: "assistant", content: clientText });
 
-        await new Promise((r) => setTimeout(r, 1200));
+        await new Promise((r) => setTimeout(r, 1000));
         await waSock.sendMessage(remoteJid, { text: clientText });
+        lastOutgoingMessage = { time: new Date().toISOString(), to: customerPhone, text: clientText };
         console.log(`✅ [OUTGOING SENT] +${customerPhone}: ${clientText}\n`);
       } catch (err) {
         console.error(`❌ [AI / SEND ERROR] +${customerPhone}:`, err.message);
         try {
-          await waSock.sendMessage(remoteJid, {
-            text: "שלום! קיבלנו את פנייתך ב-Fixli. מומחה מטעמנו יחזור אליך בהקדם האפשרי. / Здравствуйте! Мы получили ваше обращение в Fixli. Мастер свяжется с вами в ближайшее время."
-          });
+          const fallbackText = "שלום! קיבלנו את פנייתך ב-Fixli. מומחה מטעמנו יחזור אליך בהקדם האפשרי. / Здравствуйте! Мы получили ваше обращение в Fixli. Мастер свяжется с вами в ближайшее время.";
+          await waSock.sendMessage(remoteJid, { text: fallbackText });
+          lastOutgoingMessage = { time: new Date().toISOString(), to: customerPhone, text: fallbackText, error: err.message };
         } catch (e) {
           console.error("Failed to send fallback reply:", e.message);
         }
@@ -210,7 +217,7 @@ app.get("/pair", async (req, res) => {
     return res.status(500).json({ error: "WhatsApp сервис еще инициализируется, подождите пару секунд" });
   }
   if (isConnected) {
-    return res.json({ error: "WhatsApp уже подключен!" });
+    return res.json({ error: "WhatsApp уже подключен!", user: waSock.user });
   }
 
   try {
@@ -249,6 +256,39 @@ app.get("/test-ai", async (req, res) => {
   }
 });
 
+// Debug endpoint: inspect logged-in WhatsApp account and recent events
+app.get("/debug", (req, res) => {
+  res.json({
+    connected: isConnected,
+    user: waSock?.user || null,
+    qrAvailable: !!currentQR,
+    aiModel: AI_MODEL,
+    isGemini: isGemini,
+    lastUpsertEvent,
+    lastIncomingMessage,
+    lastOutgoingMessage
+  });
+});
+
+// Send test message endpoint: send direct message to any phone via WhatsApp
+app.get("/send-test", async (req, res) => {
+  const phone = req.query.phone || "972532464636";
+  const cleanPhone = phone.replace(/\D/g, "");
+  const jid = `${cleanPhone}@s.whatsapp.net`;
+
+  if (!waSock || !isConnected) {
+    return res.status(500).json({ error: "WhatsApp не подключен", isConnected });
+  }
+
+  try {
+    const text = req.query.text || "⚡️ Привет! Это тестовое сообщение от Fixli бота. Связь работает!";
+    const result = await waSock.sendMessage(jid, { text });
+    res.json({ success: true, target: jid, messageId: result?.key?.id, sender: waSock.user });
+  } catch (err) {
+    res.status(500).json({ error: err.message, sender: waSock?.user });
+  }
+});
+
 // Web UI for monitoring and QR scan
 app.get("/", (req, res) => {
   res.send(`
@@ -273,7 +313,7 @@ app.get("/", (req, res) => {
         <div class="badge ${isConnected ? "online" : "waiting"}">
           ${isConnected ? "● ОНЛАЙН 24/7" : "ОЖИДАНИЕ ПРИВЯЗКИ WHATSAPP"}
         </div>
-        <p>${isConnected ? "WhatsApp подключен к номеру Fixli. Бот принимает входящие заявки и отвечает через " + (isGemini ? "Google Gemini (FREE)" : "GPT-4o") + "." : "WhatsApp не привязан. Нажмите кнопку ниже для привязки через QR или код."}</p>
+        <p>${isConnected ? "WhatsApp подключен к номеру Fixli (" + (waSock?.user?.id || "") + "). Бот принимает входящие заявки и отвечает через " + (isGemini ? "Google Gemini (FREE)" : "GPT-4o") + "." : "WhatsApp не привязан. Нажмите кнопку ниже для привязки через QR или код."}</p>
         ${!isConnected ? '<a class="btn" href="/qr">Открыть страницу привязки</a>' : '<p style="color:#10b981;">Все системы работают в штатном режиме.</p>'}
       </div>
     </body>
@@ -286,6 +326,7 @@ app.get("/qr", (req, res) => {
     return res.send(`
       <body style="background:#0b0f19;color:#fff;text-align:center;padding:50px;font-family:sans-serif;">
         <h2 style="color:#10b981;">WhatsApp уже подключен!</h2>
+        <p>Аккаунт: ${waSock?.user?.id || "Fixli"}</p>
         <p>Бот активен и отвечает на сообщения.</p>
         <a href="/" style="color:#60a5fa;">Вернуться на главную</a>
       </body>
@@ -369,7 +410,12 @@ app.get("/qr", (req, res) => {
 });
 
 app.get("/status", (req, res) => {
-  res.json({ connected: isConnected, qrAvailable: !!currentQR, qr: currentQR });
+  res.json({
+    connected: isConnected,
+    qrAvailable: !!currentQR,
+    qr: currentQR,
+    user: waSock?.user || null
+  });
 });
 
 app.get("/health", (req, res) => {
