@@ -5,7 +5,8 @@ const { OpenAI } = require("openai");
 const {
   default: makeWASocket,
   useMultiFileAuthState,
-  DisconnectReason
+  DisconnectReason,
+  Browsers
 } = require("@whiskeysockets/baileys");
 const pino = require("pino");
 const { SYSTEM_PROMPT } = require("./system_prompt");
@@ -29,7 +30,6 @@ const conversations = new Map();
 async function notifyDima(leadText, customerPhone) {
   console.log(`\n🔥 [NEW QUALIFIED LEAD] from ${customerPhone}:\n${leadText}\n`);
   
-  // 1. If Telegram Bot Token & Chat ID provided, send instant message
   if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_ADMIN_CHAT_ID) {
     try {
       const tgUrl = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -48,7 +48,6 @@ async function notifyDima(leadText, customerPhone) {
     }
   }
 
-  // 2. If Dima's personal WhatsApp number configured, forward lead to him
   if (process.env.DIMA_PERSONAL_PHONE && waSock && isConnected) {
     try {
       const dimaJid = `${process.env.DIMA_PERSONAL_PHONE.replace(/\D/g, "")}@s.whatsapp.net`;
@@ -68,9 +67,13 @@ async function connectToWhatsApp() {
 
   waSock = makeWASocket({
     auth: state,
-    printQRInTerminal: true,
+    printQRInTerminal: false,
     logger: pino({ level: "silent" }),
-    browser: ["Fixli AI", "Chrome", "1.0.0"]
+    // Official trusted browser fingerprint so WhatsApp doesn't block linking
+    browser: Browsers.ubuntu("Chrome"),
+    connectTimeoutMs: 60000,
+    defaultQueryTimeoutMs: 60000,
+    keepAliveIntervalMs: 10000
   });
 
   waSock.ev.on("connection.update", async (update) => {
@@ -78,19 +81,14 @@ async function connectToWhatsApp() {
 
     if (qr) {
       currentQR = await QRCode.toDataURL(qr);
-      console.log("\n[QR CODE READY] Scan via http://localhost:" + PORT + "/qr or terminal");
+      console.log("\n[QR CODE UPDATED] Fresh QR code ready for scan");
     }
 
     if (connection === "close") {
       isConnected = false;
-      const shouldReconnect =
-        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log(
-        "Connection closed due to:",
-        lastDisconnect?.error,
-        ", reconnecting:",
-        shouldReconnect
-      );
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      console.log("Connection closed, status:", statusCode, "reconnecting:", shouldReconnect);
       if (shouldReconnect) {
         setTimeout(connectToWhatsApp, 3000);
       }
@@ -108,7 +106,6 @@ async function connectToWhatsApp() {
     const msg = m.messages[0];
     if (!msg || !msg.message || msg.key.fromMe) return;
 
-    // Ignore status broadcasts and groups
     const remoteJid = msg.key.remoteJid;
     if (remoteJid.includes("@g.us") || remoteJid.includes("status@broadcast")) return;
 
@@ -123,23 +120,19 @@ async function connectToWhatsApp() {
 
     console.log(`[INCOMING] +${customerPhone}: ${text}`);
 
-    // Manage conversation history
     if (!conversations.has(customerPhone)) {
       conversations.set(customerPhone, []);
     }
     const history = conversations.get(customerPhone);
     history.push({ role: "user", content: text });
 
-    // Keep last 10 turns
     if (history.length > 20) {
       history.splice(0, history.length - 20);
     }
 
     try {
-      // Show "typing..." indicator in WhatsApp
       await waSock.sendPresenceUpdate("composing", remoteJid);
 
-      // Call OpenAI
       const response = await openai.chat.completions.create({
         model: process.env.OPENAI_MODEL || "gpt-4o-mini",
         messages: [{ role: "system", content: SYSTEM_PROMPT }, ...history],
@@ -150,7 +143,6 @@ async function connectToWhatsApp() {
       const reply = response.choices[0]?.message?.content || "";
       let clientText = reply;
 
-      // Check if lead data is present in response
       if (reply.includes("[LEAD_DATA]")) {
         const leadMatch = reply.match(/\[LEAD_DATA\]([\s\S]*?)\[\/LEAD_DATA\]/);
         if (leadMatch) {
@@ -162,10 +154,7 @@ async function connectToWhatsApp() {
 
       history.push({ role: "assistant", content: clientText });
 
-      // Simulate natural typing delay (1.5 - 2.5s)
       await new Promise((r) => setTimeout(r, 1800));
-
-      // Send WhatsApp message back to client
       await waSock.sendMessage(remoteJid, { text: clientText });
       console.log(`[OUTGOING] +${customerPhone}: ${clientText}`);
     } catch (err) {
@@ -174,6 +163,28 @@ async function connectToWhatsApp() {
   });
 }
 
+// Pairing Code endpoint
+app.get("/pair", async (req, res) => {
+  const phone = req.query.phone || "972552947783";
+  const cleanPhone = phone.replace(/\D/g, "");
+  
+  if (!waSock) {
+    return res.status(500).json({ error: "WhatsApp сервис еще инициализируется, подождите пару секунд" });
+  }
+  if (isConnected) {
+    return res.json({ error: "WhatsApp уже подключен!" });
+  }
+
+  try {
+    const code = await waSock.requestPairingCode(cleanPhone);
+    console.log(`[PAIRING CODE GENERATED] for +${cleanPhone}: ${code}`);
+    res.json({ success: true, code });
+  } catch (err) {
+    console.error("Pairing code error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Web UI for monitoring and QR scan
 app.get("/", (req, res) => {
   res.send(`
@@ -181,7 +192,7 @@ app.get("/", (req, res) => {
     <html lang="ru">
     <head>
       <meta charset="utf-8">
-      <title>Fixli WhatsApp GPT Bot</title>
+      <title>Fixli AI Assistant</title>
       <meta name="viewport" content="width=device-width, initial-scale=1">
       <style>
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0b0f19; color: #fff; padding: 40px 20px; text-align: center; }
@@ -196,10 +207,10 @@ app.get("/", (req, res) => {
       <div class="card">
         <h1>Fixli AI Assistant</h1>
         <div class="badge ${isConnected ? "online" : "waiting"}">
-          ${isConnected ? "● ОНЛАЙН 24/7" : "ОЖИДАНИЕ СКАНА QR"}
+          ${isConnected ? "● ОНЛАЙН 24/7" : "ОЖИДАНИЕ ПРИВЯЗКИ WHATSAPP"}
         </div>
-        <p>${isConnected ? "WhatsApp подключен к номеру Fixli. Бот принимает входящие заявки и отвечает через GPT-4o-mini." : "WhatsApp не привязан. Отсканируйте QR-код для привязки номера."}</p>
-        ${!isConnected ? '<a class="btn" href="/qr">Открыть QR-код для скана</a>' : '<p style="color:#10b981;">Все системы работают в штатном режиме.</p>'}
+        <p>${isConnected ? "WhatsApp подключен к номеру Fixli. Бот принимает входящие заявки и отвечает через GPT-4o-mini." : "WhatsApp не привязан. Нажмите кнопку ниже для привязки через QR или код."}</p>
+        ${!isConnected ? '<a class="btn" href="/qr">Открыть страницу привязки</a>' : '<p style="color:#10b981;">Все системы работают в штатном режиме.</p>'}
       </div>
     </body>
     </html>
@@ -217,42 +228,77 @@ app.get("/qr", (req, res) => {
     `);
   }
 
-  if (!currentQR) {
-    return res.send(`
-      <body style="background:#0b0f19;color:#fff;text-align:center;padding:50px;font-family:sans-serif;">
-        <h2>Генерация QR-кода...</h2>
-        <p>Пожалуйста, обновите страницу через 3 секунды.</p>
-        <script>setTimeout(() => location.reload(), 3000);</script>
-      </body>
-    `);
-  }
-
   res.send(`
     <!DOCTYPE html>
-    <html>
+    <html lang="ru">
     <head>
       <meta charset="utf-8">
-      <title>Сканирование QR-кода Fixli WhatsApp</title>
+      <title>Привязка WhatsApp Fixli</title>
       <meta name="viewport" content="width=device-width, initial-scale=1">
       <style>
         body { background: #0b0f19; color: #fff; text-align: center; font-family: -apple-system, sans-serif; padding: 30px 15px; }
-        .box { background: #151c2c; max-width: 420px; margin: 0 auto; padding: 25px; border-radius: 16px; border: 1px solid rgba(255,255,255,0.1); }
-        img { border-radius: 12px; margin: 15px 0; max-width: 100%; background: #fff; padding: 10px; }
+        .box { background: #151c2c; max-width: 440px; margin: 0 auto; padding: 25px; border-radius: 16px; border: 1px solid rgba(255,255,255,0.1); }
+        img { border-radius: 12px; margin: 15px 0; max-width: 280px; width: 100%; background: #fff; padding: 10px; }
+        .btn { background: #10b981; color: #fff; border: none; padding: 12px 20px; border-radius: 8px; font-weight: bold; cursor: pointer; font-size: 15px; margin-top: 10px; width: 100%; }
+        .code-box { font-size: 32px; letter-spacing: 6px; color: #38bdf8; font-weight: bold; margin: 15px 0; font-family: monospace; background: #0b0f19; padding: 12px; border-radius: 8px; border: 1px dashed #38bdf8; }
+        .divider { border-top: 1px solid rgba(255,255,255,0.1); margin: 25px 0; position: relative; }
+        .divider span { position: absolute; top: -10px; left: 50%; transform: translateX(-50%); background: #151c2c; padding: 0 10px; color: #94a3b8; font-size: 12px; }
       </style>
       <script>
+        // Auto-refresh QR code every 3 seconds so it NEVER expires
         setInterval(async () => {
-          const res = await fetch('/status');
-          const data = await res.json();
-          if (data.connected) location.href = '/';
+          try {
+            const res = await fetch('/status');
+            const data = await res.json();
+            if (data.connected) {
+              location.href = '/';
+              return;
+            }
+            if (data.qr) {
+              const img = document.getElementById('qrImg');
+              if (img) img.src = data.qr;
+            }
+          } catch(e) {}
         }, 3000);
+
+        async function requestPairingCode() {
+          const btn = document.getElementById('pairBtn');
+          const codeEl = document.getElementById('pairingCodeDisplay');
+          btn.disabled = true;
+          btn.innerText = 'Запрашиваю 8-значный код...';
+          codeEl.style.display = 'block';
+          codeEl.innerText = '...';
+
+          try {
+            const res = await fetch('/pair?phone=972552947783');
+            const data = await res.json();
+            if (data.code) {
+              codeEl.innerText = data.code;
+              btn.innerText = 'Код получен! Введите его в WhatsApp';
+            } else {
+              codeEl.innerText = data.error || 'Ошибка';
+              btn.disabled = false;
+              btn.innerText = 'Попробовать снова';
+            }
+          } catch(e) {
+            codeEl.innerText = 'Ошибка соединения';
+            btn.disabled = false;
+          }
+        }
       </script>
     </head>
     <body>
       <div class="box">
         <h2>Привязка WhatsApp Fixli</h2>
-        <p style="font-size:14px;color:#94a3b8;">Откройте WhatsApp на телефоне Димы → Настройки → Связанные устройства → Привязка устройства</p>
-        <img src="${currentQR}" alt="WhatsApp QR Code" />
-        <p style="font-size:12px;color:#64748b;">Страница автоматически обновится после сканирования</p>
+        <p style="font-size:13px;color:#94a3b8;">Способ 1: Отсканируйте свежий QR-код через камеру (он обновляется сам):</p>
+        <img id="qrImg" src="${currentQR || ""}" alt="WhatsApp QR Code" />
+
+        <div class="divider"><span>ИЛИ БЕЗ КАМЕРЫ</span></div>
+
+        <p style="font-size:13px;color:#94a3b8;">Способ 2: Привязка по 8-значному коду для +972 55-294-7783:</p>
+        <button id="pairBtn" class="btn" onclick="requestPairingCode()">Получить 8-значный код</button>
+        <div id="pairingCodeDisplay" class="code-box" style="display:none;"></div>
+        <p style="font-size:12px;color:#64748b;margin-top:8px;">В WhatsApp на телефоне: Связанные устройства → Привязать устройство → «Привязать по номеру телефона» → введите этот код.</p>
       </div>
     </body>
     </html>
@@ -260,7 +306,7 @@ app.get("/qr", (req, res) => {
 });
 
 app.get("/status", (req, res) => {
-  res.json({ connected: isConnected, qrAvailable: !!currentQR });
+  res.json({ connected: isConnected, qrAvailable: !!currentQR, qr: currentQR });
 });
 
 app.get("/health", (req, res) => {
