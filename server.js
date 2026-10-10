@@ -277,7 +277,7 @@ app.get("/check-phone", async (req, res) => {
   }
 });
 
-// Reset session cleanly
+// Reset session cleanly by clearing files inside auth folder without deleting mounted dir
 app.get("/reset-session", async (req, res) => {
   const fs = require("fs");
   const path = require("path");
@@ -289,13 +289,17 @@ app.get("/reset-session", async (req, res) => {
     currentQR = null;
     const authDir = path.join(__dirname, "auth_info_baileys");
     if (fs.existsSync(authDir)) {
-      fs.rmSync(authDir, { recursive: true, force: true });
+      const items = fs.readdirSync(authDir);
+      for (const item of items) {
+        try {
+          fs.rmSync(path.join(authDir, item), { recursive: true, force: true });
+        } catch (err) {}
+      }
     }
-    fs.mkdirSync(authDir, { recursive: true });
     setTimeout(() => {
       connectToWhatsApp();
     }, 1500);
-    res.json({ success: true, message: "Сессия успешно сброшена! Откройте /qr для новой чистой привязки." });
+    res.json({ success: true, message: "Файлы сессии удалены! Перейдите на /qr для чистой привязки." });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
