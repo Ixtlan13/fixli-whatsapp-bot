@@ -22,6 +22,20 @@ let lastIncomingMessage = null;
 let lastOutgoingMessage = null;
 const messageStore = new Map();
 const recentEvents = [];
+const msgRetryCounterMap = new Map();
+
+const msgRetryCounterCache = {
+  get: (key) => msgRetryCounterMap.get(key),
+  set: (key, val) => {
+    msgRetryCounterMap.set(key, val);
+    if (msgRetryCounterMap.size > 2000) {
+      const first = msgRetryCounterMap.keys().next().value;
+      msgRetryCounterMap.delete(first);
+    }
+  },
+  del: (key) => msgRetryCounterMap.delete(key),
+  flushAll: () => msgRetryCounterMap.clear()
+};
 
 function logEvent(type, data) {
   const item = { time: new Date().toISOString(), type, ...data };
@@ -123,6 +137,7 @@ async function connectToWhatsApp() {
 
   waSock = makeWASocket({
     auth: state,
+    msgRetryCounterCache,
     printQRInTerminal: false,
     logger: pino({ level: "silent" }),
     browser: Browsers.ubuntu("Chrome"),
@@ -231,7 +246,7 @@ async function connectToWhatsApp() {
     } catch (err) {
       console.error(`❌ [AI / SEND ERROR] +${customerPhone}:`, err.message);
       try {
-        const fallbackText = "שלום! קיבלנו את פנייתך ב-Fixli. מומחה מטעמנו יחזור אליך בהקדם האפשרי. / Здравствуйте! Мы получили ваше обращение в Fixli. Мастер свяжется с вами в ближайшее время.";
+        const fallbackText = "שלום! קיבלנו את פниетך ב-Fixli. מומחה מטעמנו יחזור אליך בהקדם האפשרי. / Здравствуйте! Мы получили ваше обращение в Fixli. Мастер свяжется с вами в ближайшее время.";
         await waSock.sendMessage(remoteJid, { text: fallbackText });
         lastOutgoingMessage = { time: new Date().toISOString(), to: customerPhone, text: fallbackText, error: err.message };
       } catch (e) {
