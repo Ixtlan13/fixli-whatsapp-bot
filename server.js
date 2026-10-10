@@ -101,64 +101,88 @@ async function connectToWhatsApp() {
 
   waSock.ev.on("creds.update", saveCreds);
 
-  // Incoming message handler
+  // Incoming message handler - handles all messages in array & unwraps ephemeral/viewOnce
   waSock.ev.on("messages.upsert", async (m) => {
-    const msg = m.messages[0];
-    if (!msg || !msg.message || msg.key.fromMe) return;
+    if (!m.messages || !m.messages.length) return;
 
-    const remoteJid = msg.key.remoteJid;
-    if (remoteJid.includes("@g.us") || remoteJid.includes("status@broadcast")) return;
+    for (const msg of m.messages) {
+      if (!msg || !msg.message || msg.key.fromMe) continue;
 
-    const customerPhone = remoteJid.replace("@s.whatsapp.net", "");
-    const text =
-      msg.message.conversation ||
-      msg.message.extendedTextMessage?.text ||
-      msg.message.imageMessage?.caption ||
-      "";
+      const remoteJid = msg.key.remoteJid;
+      if (!remoteJid || remoteJid.includes("@g.us") || remoteJid.includes("status@broadcast")) continue;
 
-    if (!text.trim()) return;
+      const customerPhone = remoteJid.replace("@s.whatsapp.net", "");
 
-    console.log(`[INCOMING] +${customerPhone}: ${text}`);
+      // Robust unwrap of wrapped messages (ephemeral, viewOnce, document captions)
+      const content =
+        msg.message.ephemeralMessage?.message ||
+        msg.message.viewOnceMessage?.message ||
+        msg.message.viewOnceMessageV2?.message ||
+        msg.message.documentWithCaptionMessage?.message ||
+        msg.message;
 
-    if (!conversations.has(customerPhone)) {
-      conversations.set(customerPhone, []);
-    }
-    const history = conversations.get(customerPhone);
-    history.push({ role: "user", content: text });
+      const text =
+        content.conversation ||
+        content.extendedTextMessage?.text ||
+        content.imageMessage?.caption ||
+        "";
 
-    if (history.length > 20) {
-      history.splice(0, history.length - 20);
-    }
-
-    try {
-      await waSock.sendPresenceUpdate("composing", remoteJid);
-
-      const response = await openai.chat.completions.create({
-        model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-        messages: [{ role: "system", content: SYSTEM_PROMPT }, ...history],
-        temperature: 0.6,
-        max_tokens: 300
-      });
-
-      const reply = response.choices[0]?.message?.content || "";
-      let clientText = reply;
-
-      if (reply.includes("[LEAD_DATA]")) {
-        const leadMatch = reply.match(/\[LEAD_DATA\]([\s\S]*?)\[\/LEAD_DATA\]/);
-        if (leadMatch) {
-          const leadData = leadMatch[1].trim();
-          notifyDima(leadData, customerPhone);
-          clientText = reply.replace(/\[LEAD_DATA\][\s\S]*?\[\/LEAD_DATA\]/, "").trim();
-        }
+      if (!text || !text.trim()) {
+        console.log(`[SKIPPED NON-TEXT/PROTOCOL MSG] from +${customerPhone}`);
+        continue;
       }
 
-      history.push({ role: "assistant", content: clientText });
+      console.log(`\n💬 [INCOMING] +${customerPhone}: ${text}`);
 
-      await new Promise((r) => setTimeout(r, 1800));
-      await waSock.sendMessage(remoteJid, { text: clientText });
-      console.log(`[OUTGOING] +${customerPhone}: ${clientText}`);
-    } catch (err) {
-      console.error("Error processing message:", err.message);
+      if (!conversations.has(customerPhone)) {
+        conversations.set(customerPhone, []);
+      }
+      const history = conversations.get(customerPhone);
+      history.push({ role: "user", content: text });
+
+      if (history.length > 20) {
+        history.splice(0, history.length - 20);
+      }
+
+      try {
+        await waSock.sendPresenceUpdate("composing", remoteJid);
+
+        console.log(`[AI] Generating response for +${customerPhone}...`);
+
+        const response = await openai.chat.completions.create({
+          model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+          messages: [{ role: "system", content: SYSTEM_PROMPT }, ...history],
+          temperature: 0.6,
+          max_tokens: 300
+        });
+
+        const reply = response.choices[0]?.message?.content || "";
+        let clientText = reply;
+
+        if (reply.includes("[LEAD_DATA]")) {
+          const leadMatch = reply.match(/\[LEAD_DATA\]([\s\S]*?)\[\/LEAD_DATA\]/);
+          if (leadMatch) {
+            const leadData = leadMatch[1].trim();
+            notifyDima(leadData, customerPhone);
+            clientText = reply.replace(/\[LEAD_DATA\][\s\S]*?\[\/LEAD_DATA\]/, "").trim();
+          }
+        }
+
+        history.push({ role: "assistant", content: clientText });
+
+        await new Promise((r) => setTimeout(r, 1200));
+        await waSock.sendMessage(remoteJid, { text: clientText });
+        console.log(`✅ [OUTGOING SENT] +${customerPhone}: ${clientText}\n`);
+      } catch (err) {
+        console.error(`❌ [ERROR HANDLING MSG] +${customerPhone}:`, err.message);
+        try {
+          await waSock.sendMessage(remoteJid, {
+            text: "שלום! קיבלנו את פנייתך ב-Fixli. מומחה מטעמנו יחזור אליך בהקדם האפשרי. / Здравствуйте! Мы получили ваше обращение в Fixli. Мастер свяжется с вами в ближайшее время."
+          });
+        } catch (e) {
+          console.error("Failed to send fallback reply:", e.message);
+        }
+      }
     }
   });
 }
@@ -182,6 +206,30 @@ app.get("/pair", async (req, res) => {
   } catch (err) {
     console.error("Pairing code error:", err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// Diagnostic endpoint to verify OpenAI credentials
+app.get("/test-ai", async (req, res) => {
+  try {
+    const rawKey = process.env.OPENAI_API_KEY || "";
+    const keyPreview = rawKey.length > 8 ? `${rawKey.slice(0, 7)}...${rawKey.slice(-4)}` : "NOT_SET";
+    const response = await openai.chat.completions.create({
+      model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+      messages: [{ role: "user", content: "Ответь одним словом: РАБОТАЕТ" }],
+      max_tokens: 10
+    });
+    res.json({
+      status: "ok",
+      apiKeyConfigured: keyPreview,
+      reply: response.choices[0]?.message?.content
+    });
+  } catch (err) {
+    res.status(500).json({
+      status: "error",
+      apiKeyConfigured: process.env.OPENAI_API_KEY ? "YES" : "NO",
+      message: err.message
+    });
   }
 });
 
