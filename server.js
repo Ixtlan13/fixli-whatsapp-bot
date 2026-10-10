@@ -21,6 +21,43 @@ let lastUpsertEvent = null;
 let lastIncomingMessage = null;
 let lastOutgoingMessage = null;
 const messageStore = new Map();
+const recentEvents = [];
+
+function logEvent(type, data) {
+  const item = { time: new Date().toISOString(), type, ...data };
+  recentEvents.unshift(item);
+  if (recentEvents.length > 25) recentEvents.pop();
+}
+
+function extractMessageText(msg) {
+  if (!msg || !msg.message) return "";
+  let m = msg.message;
+  if (m.ephemeralMessage?.message) m = m.ephemeralMessage.message;
+  if (m.viewOnceMessage?.message) m = m.viewOnceMessage.message;
+  if (m.viewOnceMessageV2?.message) m = m.viewOnceMessageV2.message;
+  if (m.documentWithCaptionMessage?.message) m = m.documentWithCaptionMessage.message;
+  
+  return (
+    m.conversation ||
+    m.extendedTextMessage?.text ||
+    m.imageMessage?.caption ||
+    m.videoMessage?.caption ||
+    m.buttonsResponseMessage?.selectedDisplayText ||
+    m.listResponseMessage?.title ||
+    m.templateButtonReplyMessage?.selectedId ||
+    ""
+  );
+}
+
+process.on("uncaughtException", (err) => {
+  console.error("CRITICAL UNCAUGHT EXCEPTION:", err);
+  logEvent("uncaught_error", { error: err.message, stack: err.stack });
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("CRITICAL UNHANDLED REJECTION:", reason);
+  logEvent("unhandled_rejection", { reason: String(reason) });
+});
 
 // Determine AI Provider (Google Gemini is 100% free; fallback to OpenAI)
 const rawKey = (process.env.GEMINI_API_KEY || process.env.OPENAI_API_KEY || "").trim();
@@ -124,91 +161,102 @@ async function connectToWhatsApp() {
 
   waSock.ev.on("creds.update", saveCreds);
 
-  // Incoming message handler
+  // Incoming message handler helper
+  async function handleIncomingMessage(msg, eventSource) {
+    if (!msg) return;
+    const remoteJid = msg.key?.remoteJid;
+    if (!remoteJid || remoteJid.includes("@g.us") || remoteJid.includes("status@broadcast")) return;
+
+    const fromMe = !!msg.key?.fromMe;
+    const text = extractMessageText(msg);
+
+    logEvent(eventSource || "msg_event", {
+      jid: remoteJid,
+      fromMe,
+      hasMessage: !!msg.message,
+      messageKeys: msg.message ? Object.keys(msg.message) : [],
+      stubType: msg.messageStubType,
+      text: text || "<none>"
+    });
+
+    if (fromMe) return;
+    if (!text || !text.trim()) return;
+
+    const customerPhone = remoteJid.replace("@s.whatsapp.net", "").replace("@lid", "");
+    lastIncomingMessage = { time: new Date().toISOString(), from: customerPhone, jid: remoteJid, text };
+    console.log(`\n💬 [INCOMING] +${customerPhone}: ${text}`);
+
+    if (!conversations.has(customerPhone)) {
+      conversations.set(customerPhone, []);
+    }
+    const history = conversations.get(customerPhone);
+    history.push({ role: "user", content: text });
+
+    if (history.length > 20) {
+      history.splice(0, history.length - 20);
+    }
+
+    try {
+      try {
+        await waSock.sendPresenceUpdate("composing", remoteJid);
+      } catch (e) {}
+
+      console.log(`[AI] Generating response for +${customerPhone} using ${AI_MODEL}...`);
+
+      const response = await openai.chat.completions.create({
+        model: AI_MODEL,
+        messages: [{ role: "system", content: SYSTEM_PROMPT }, ...history],
+        temperature: 0.6,
+        max_tokens: 300
+      });
+
+      const reply = response.choices[0]?.message?.content || "";
+      let clientText = reply;
+
+      if (reply.includes("[LEAD_DATA]")) {
+        const leadMatch = reply.match(/\[LEAD_DATA\]([\s\S]*?)\[\/LEAD_DATA\]/);
+        if (leadMatch) {
+          const leadData = leadMatch[1].trim();
+          notifyDima(leadData, customerPhone);
+          clientText = reply.replace(/\[LEAD_DATA\][\s\S]*?\[\/LEAD_DATA\]/, "").trim();
+        }
+      }
+
+      history.push({ role: "assistant", content: clientText });
+
+      await new Promise((r) => setTimeout(r, 1000));
+      await waSock.sendMessage(remoteJid, { text: clientText });
+      lastOutgoingMessage = { time: new Date().toISOString(), to: customerPhone, text: clientText };
+      console.log(`✅ [OUTGOING SENT] +${customerPhone}: ${clientText}\n`);
+    } catch (err) {
+      console.error(`❌ [AI / SEND ERROR] +${customerPhone}:`, err.message);
+      try {
+        const fallbackText = "שלום! קיבלנו את פנייתך ב-Fixli. מומחה מטעמנו יחזור אליך בהקדם האפשרי. / Здравствуйте! Мы получили ваше обращение в Fixli. Мастер свяжется с вами в ближайшее время.";
+        await waSock.sendMessage(remoteJid, { text: fallbackText });
+        lastOutgoingMessage = { time: new Date().toISOString(), to: customerPhone, text: fallbackText, error: err.message };
+      } catch (e) {
+        console.error("Failed to send fallback reply:", e.message);
+      }
+    }
+  }
+
   waSock.ev.on("messages.upsert", async (m) => {
     lastUpsertEvent = { time: new Date().toISOString(), type: m.type, count: m.messages?.length };
     if (!m.messages || !m.messages.length) return;
 
     for (const msg of m.messages) {
-      if (!msg || !msg.message) continue;
-      if (msg.key?.id) messageStore.set(msg.key.id, msg.message);
+      if (!msg) continue;
+      if (msg.key?.id && msg.message) messageStore.set(msg.key.id, msg.message);
+      await handleIncomingMessage(msg, `upsert_${m.type}`);
+    }
+  });
 
-      const remoteJid = msg.key.remoteJid;
-      if (!remoteJid || remoteJid.includes("@g.us") || remoteJid.includes("status@broadcast")) continue;
-
-      const customerPhone = remoteJid.replace("@s.whatsapp.net", "");
-
-      // Robust unwrap of wrapped messages (ephemeral, viewOnce, document captions)
-      const content =
-        msg.message.ephemeralMessage?.message ||
-        msg.message.viewOnceMessage?.message ||
-        msg.message.viewOnceMessageV2?.message ||
-        msg.message.documentWithCaptionMessage?.message ||
-        msg.message;
-
-      const text =
-        content.conversation ||
-        content.extendedTextMessage?.text ||
-        content.imageMessage?.caption ||
-        "";
-
-      console.log(`[RAW MSG] fromMe: ${msg.key.fromMe}, jid: ${remoteJid}, text: ${text || "<empty/media>"}`);
-
-      if (msg.key.fromMe) continue;
-      if (!text || !text.trim()) continue;
-
-      lastIncomingMessage = { time: new Date().toISOString(), from: customerPhone, text };
-      console.log(`\n💬 [INCOMING] +${customerPhone}: ${text}`);
-
-      if (!conversations.has(customerPhone)) {
-        conversations.set(customerPhone, []);
-      }
-      const history = conversations.get(customerPhone);
-      history.push({ role: "user", content: text });
-
-      if (history.length > 20) {
-        history.splice(0, history.length - 20);
-      }
-
-      try {
-        await waSock.sendPresenceUpdate("composing", remoteJid);
-
-        console.log(`[AI] Generating response for +${customerPhone} using ${AI_MODEL}...`);
-
-        const response = await openai.chat.completions.create({
-          model: AI_MODEL,
-          messages: [{ role: "system", content: SYSTEM_PROMPT }, ...history],
-          temperature: 0.6,
-          max_tokens: 300
-        });
-
-        const reply = response.choices[0]?.message?.content || "";
-        let clientText = reply;
-
-        if (reply.includes("[LEAD_DATA]")) {
-          const leadMatch = reply.match(/\[LEAD_DATA\]([\s\S]*?)\[\/LEAD_DATA\]/);
-          if (leadMatch) {
-            const leadData = leadMatch[1].trim();
-            notifyDima(leadData, customerPhone);
-            clientText = reply.replace(/\[LEAD_DATA\][\s\S]*?\[\/LEAD_DATA\]/, "").trim();
-          }
-        }
-
-        history.push({ role: "assistant", content: clientText });
-
-        await new Promise((r) => setTimeout(r, 1000));
-        await waSock.sendMessage(remoteJid, { text: clientText });
-        lastOutgoingMessage = { time: new Date().toISOString(), to: customerPhone, text: clientText };
-        console.log(`✅ [OUTGOING SENT] +${customerPhone}: ${clientText}\n`);
-      } catch (err) {
-        console.error(`❌ [AI / SEND ERROR] +${customerPhone}:`, err.message);
-        try {
-          const fallbackText = "שלום! קיבלנו את פנייתך ב-Fixli. מומחה מטעמנו יחזור אליך בהקדם האפשרי. / Здравствуйте! Мы получили ваше обращение в Fixli. Мастер свяжется с вами в ближайшее время.";
-          await waSock.sendMessage(remoteJid, { text: fallbackText });
-          lastOutgoingMessage = { time: new Date().toISOString(), to: customerPhone, text: fallbackText, error: err.message };
-        } catch (e) {
-          console.error("Failed to send fallback reply:", e.message);
-        }
+  waSock.ev.on("messages.update", async (updates) => {
+    if (!updates || !updates.length) return;
+    for (const u of updates) {
+      logEvent("msg_update", { key: u.key, updateKeys: u.update ? Object.keys(u.update) : [] });
+      if (u.update?.message) {
+        await handleIncomingMessage({ key: u.key, message: u.update.message }, "update_decrypted");
       }
     }
   });
@@ -277,7 +325,7 @@ app.get("/check-phone", async (req, res) => {
   }
 });
 
-// Reset session cleanly by clearing files inside auth folder without deleting mounted dir
+// Reset session cleanly
 app.get("/reset-session", async (req, res) => {
   const fs = require("fs");
   const path = require("path");
@@ -299,7 +347,7 @@ app.get("/reset-session", async (req, res) => {
     setTimeout(() => {
       connectToWhatsApp();
     }, 1500);
-    res.json({ success: true, message: "Файлы сессии удалены! Перейдите на /qr для чистой привязки." });
+    res.json({ success: true, message: "Сессия успешно сброшена! Откройте /qr для новой чистой привязки." });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -315,7 +363,8 @@ app.get("/debug", (req, res) => {
     isGemini: isGemini,
     lastUpsertEvent,
     lastIncomingMessage,
-    lastOutgoingMessage
+    lastOutgoingMessage,
+    recentEvents
   });
 });
 
